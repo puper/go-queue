@@ -30,9 +30,13 @@ type DiskQueue struct {
 	writeFile *os.File
 	reader *bufio.Reader
 	writeBuf bytes.Buffer
+	
 	needSync bool
 	needSyncCh chan bool
+	syncTimeout float64
 	syncEvery uint32
+	unSyncTask uint32
+	
 	size int
 }
 
@@ -42,6 +46,8 @@ func NewDiskQueue (name string, dataPath string) *DiskQueue {
 		dataPath: dataPath,
 		maxBytesPerFile: 1000000,
 		needSync: false,
+		syncTimeout: 1,
+		syncEvery: 5,
 	}
 	q.retrieveMetaData()
 	go q.sync()
@@ -105,6 +111,7 @@ func (q *DiskQueue) Put(v interface{}) error {
 		}
 	}
 	q.size++
+	q.sendSyncSignal(false)
 	return err
 }
 
@@ -115,6 +122,7 @@ func (q *DiskQueue) Get() (interface{}, error) {
 	if q.readFileNum > q.writeFileNum || (q.readFileNum == q.writeFileNum && q.readPos >= q.writePos) {
 	    return nil, errors.New("empty queue")
 	}
+	q.moveForward()
 	var err error
 	var msgSize int32
 	if q.readFile == nil {
@@ -162,8 +170,8 @@ func (q *DiskQueue) Get() (interface{}, error) {
 		q.nextReadFileNum++
 		q.nextReadPos = 0
 	}
-	q.moveForward()
 	q.size--
+	q.sendSyncSignal(false)
 	return readBuf, nil
 }
 
@@ -190,18 +198,6 @@ func (q *DiskQueue) retrieveMetaData() error {
 	if err != nil {
 		return err
 	}
-	
-	q.nextReadFileNum = q.readFileNum
-	q.nextReadPos = q.readPos
-	size := q.size
-	q.size = 1
-	for v, err := q.Get(); err == nil; {
-		q.size++
-		size++
-	}
-	q.writeFileNum = q.readFileNum
-	q.writePos = q.nextReadPos
-	q.size = size
 	return nil
 }
 
@@ -233,16 +229,26 @@ func (q *DiskQueue) persistMetaData() error {
 
 func (q *DiskQueue) sync() error {
 	for {
-		q.persistMetaData()
-		time.Sleep(time.Second)
+		select {
+			case <-time.After(time.Duration(q.syncTimeout) * time.Second):
+			case <- q.needSyncCh:
+		}
+		if q.needSync {
+			q.needSync = false
+			q.persistMetaData()
+		}
 	}
 }
 
-func (q *DiskQueue) sendSyncSignal() {
+func (q *DiskQueue) sendSyncSignal(force bool) {
 	q.needSync = true
-	select {
-		case q.needSyncCh<-true:
-		default:
+	q.unSyncTask++
+	if force || q.unSyncTask == q.syncEvery {
+		q.unSyncTask = 0
+		select {
+			case q.needSyncCh<-true:
+			default:
+		}
 	}
 }
 
