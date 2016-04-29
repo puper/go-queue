@@ -1,6 +1,6 @@
 package blockqueue
 
-import(
+import (
 	"sync"
 	"time"
 )
@@ -24,14 +24,14 @@ type QueueIF interface {
 }
 
 type BlockQueue struct {
-	queue QueueIF
-	mutex *sync.Mutex
+	queue    QueueIF
+	mutex    *sync.Mutex
 	notEmpty *sync.Cond
-	notFull *sync.Cond
-	maxSize int
+	notFull  *sync.Cond
+	maxSize  int
 }
 
-func NewBlockQueue (queue QueueIF, maxSize int) *BlockQueue {
+func NewBlockQueue(queue QueueIF, maxSize int) *BlockQueue {
 	q := new(BlockQueue)
 	q.queue = queue
 	q.maxSize = maxSize
@@ -82,16 +82,16 @@ func (q *BlockQueue) Get(block bool, timeout uint) (interface{}, error) {
 		TIMEOUT:
 			for q.queue.Size() == 0 {
 				select {
-					case <-timer:
-						empty = true
-						q.cancelWait(q.notEmpty, notEmpty)
+				case <-timer:
+					empty = true
+					q.cancelWait(q.notEmpty, notEmpty)
+					break TIMEOUT
+				case <-notEmpty:
+					if q.queue.Size() == 0 {
+						go q.waitSignal(q.notEmpty, notEmpty)
+					} else {
 						break TIMEOUT
-					case <-notEmpty:
-						if q.queue.Size() == 0 {
-							go q.waitSignal(q.notEmpty, notEmpty)
-						} else {
-							break TIMEOUT
-						}
+					}
 				}
 			}
 			close(notEmpty)
@@ -100,7 +100,7 @@ func (q *BlockQueue) Get(block bool, timeout uint) (interface{}, error) {
 	if empty {
 		return nil, &EmptyQueueError{}
 	}
-	v, err := q.queue.Get();
+	v, err := q.queue.Get()
 	if err != nil {
 		return nil, err
 	}
@@ -129,16 +129,16 @@ func (q *BlockQueue) Put(v interface{}, block bool, timeout uint) error {
 			TIMEOUT:
 				for q.queue.Size() == q.maxSize {
 					select {
-						case <-timer:
-							full = true
-							q.cancelWait(q.notFull, notFull)
+					case <-timer:
+						full = true
+						q.cancelWait(q.notFull, notFull)
+						break TIMEOUT
+					case <-notFull:
+						if q.queue.Size() == q.maxSize {
+							go q.waitSignal(q.notFull, notFull)
+						} else {
 							break TIMEOUT
-						case <-notFull:
-							if q.queue.Size() == q.maxSize {
-								go q.waitSignal(q.notFull, notFull)
-							} else {
-								break TIMEOUT
-							}
+						}
 					}
 				}
 				close(notFull)
@@ -165,4 +165,3 @@ func (q *BlockQueue) cancelWait(cond *sync.Cond, c <-chan bool) {
 	cond.Signal()
 	<-c
 }
-
