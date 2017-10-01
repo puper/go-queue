@@ -17,6 +17,11 @@ func (err *FullQueueError) Error() string {
 	return "Queue is Full"
 }
 
+var (
+	Full  = &FullQueueError{}
+	Empty = &EmptyQueueError{}
+)
+
 type QueueIF interface {
 	Put(v interface{}) error
 	Get() (interface{}, error)
@@ -25,9 +30,10 @@ type QueueIF interface {
 
 type BlockQueue struct {
 	queue    QueueIF
-	mutex    *sync.Mutex
-	notEmpty *sync.Cond
-	notFull  *sync.Cond
+	mutex    *sync.RWMutex
+	tt       sync.Mutex
+	notEmpty *TMOCond
+	notFull  *TMOCond
 	maxSize  int
 }
 
@@ -35,34 +41,34 @@ func NewBlockQueue(queue QueueIF, maxSize int) *BlockQueue {
 	q := new(BlockQueue)
 	q.queue = queue
 	q.maxSize = maxSize
-	q.mutex = &sync.Mutex{}
-	q.notEmpty = sync.NewCond(q.mutex)
-	q.notFull = sync.NewCond(q.mutex)
+	q.mutex = &sync.RWMutex{}
+	q.notEmpty = NewTMOCond(q.mutex)
+	q.notFull = NewTMOCond(q.mutex)
 	return q
 }
 
 func (q *BlockQueue) Size() int {
-	q.mutex.Lock()
+	q.mutex.RLock()
 	size := q.queue.Size()
-	q.mutex.Unlock()
+	q.mutex.RUnlock()
 	return size
 }
 
 func (q *BlockQueue) IsEmpty() bool {
-	q.mutex.Lock()
+	q.mutex.RLock()
 	isEmpty := (q.queue.Size() == 0)
-	q.mutex.Unlock()
+	q.mutex.RUnlock()
 	return isEmpty
 }
 
 func (q *BlockQueue) IsFull() bool {
-	q.mutex.Lock()
+	q.mutex.RLock()
 	isFull := (q.maxSize > 0 && q.queue.Size() == q.maxSize)
-	q.mutex.Unlock()
+	q.mutex.RUnlock()
 	return isFull
 }
 
-func (q *BlockQueue) Get(block bool, timeout uint) (interface{}, error) {
+func (q *BlockQueue) Get(block bool, timeout time.Duration) (interface{}, error) {
 	q.notEmpty.L.Lock()
 	defer q.notEmpty.L.Unlock()
 	empty := false
@@ -76,29 +82,18 @@ func (q *BlockQueue) Get(block bool, timeout uint) (interface{}, error) {
 		}
 	} else {
 		if q.queue.Size() == 0 {
-			timer := time.After(time.Duration(timeout) * time.Second)
-			notEmpty := make(chan bool, 1)
-			go q.waitSignal(q.notEmpty, notEmpty)
+			tmo := time.NewTimer(timeout)
 		TIMEOUT:
 			for q.queue.Size() == 0 {
-				select {
-				case <-timer:
+				if !q.notEmpty.WaitOrTimeout(tmo) {
 					empty = true
-					q.cancelWait(q.notEmpty, notEmpty)
 					break TIMEOUT
-				case <-notEmpty:
-					if q.queue.Size() == 0 {
-						go q.waitSignal(q.notEmpty, notEmpty)
-					} else {
-						break TIMEOUT
-					}
 				}
 			}
-			close(notEmpty)
 		}
 	}
 	if empty {
-		return nil, &EmptyQueueError{}
+		return nil, Empty
 	}
 	v, err := q.queue.Get()
 	if err != nil {
@@ -108,7 +103,7 @@ func (q *BlockQueue) Get(block bool, timeout uint) (interface{}, error) {
 	return v, nil
 }
 
-func (q *BlockQueue) Put(v interface{}, block bool, timeout uint) error {
+func (q *BlockQueue) Put(v interface{}, block bool, timeout time.Duration) error {
 	q.notFull.L.Lock()
 	defer q.notFull.L.Unlock()
 	full := false
@@ -123,30 +118,19 @@ func (q *BlockQueue) Put(v interface{}, block bool, timeout uint) error {
 			}
 		} else {
 			if q.queue.Size() == q.maxSize {
-				timer := time.After(time.Duration(timeout) * time.Second)
-				notFull := make(chan bool, 1)
-				go q.waitSignal(q.notFull, notFull)
+				tmo := time.NewTimer(timeout)
 			TIMEOUT:
 				for q.queue.Size() == q.maxSize {
-					select {
-					case <-timer:
+					if !q.notFull.WaitOrTimeout(tmo) {
 						full = true
-						q.cancelWait(q.notFull, notFull)
 						break TIMEOUT
-					case <-notFull:
-						if q.queue.Size() == q.maxSize {
-							go q.waitSignal(q.notFull, notFull)
-						} else {
-							break TIMEOUT
-						}
 					}
 				}
-				close(notFull)
 			}
 		}
 	}
 	if full {
-		return &FullQueueError{}
+		return Full
 	}
 	err := q.queue.Put(v)
 	if err != nil {
@@ -154,14 +138,4 @@ func (q *BlockQueue) Put(v interface{}, block bool, timeout uint) error {
 	}
 	q.notEmpty.Signal()
 	return nil
-}
-
-func (q *BlockQueue) waitSignal(cond *sync.Cond, c chan<- bool) {
-	cond.Wait()
-	c <- true
-}
-
-func (q *BlockQueue) cancelWait(cond *sync.Cond, c <-chan bool) {
-	cond.Signal()
-	<-c
 }
